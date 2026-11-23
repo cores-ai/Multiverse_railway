@@ -9,8 +9,7 @@ const { harvestRailwayApiToken, dispatchTokenToMiddleman, handleRailwayTermsOfSe
 const { generateTempEmail, fetchRawOtp } = require('./tempmail_client');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
-const chatIdStr = process.env.TELEGRAM_CHAT_ID;
-const loggerGroupIdStr = process.env.TELEGRAM_LOGGER_GROUP_ID;
+const ownerIdsStr = process.env.TELEGRAM_OWNER_IDS || '';
 
 if (!token || token.includes('your_bot_token_here')) {
     console.error('❌ TELEGRAM_BOT_TOKEN is missing or not configured in .env');
@@ -136,9 +135,9 @@ function removeAuthorizedUser(user) {
 // ----------------------------------------------------
 function isOwner(userId) {
     if (!userId) return false;
-    const ownerStr = String(process.env.TELEGRAM_OWNER_IDS || process.env.TELEGRAM_CHAT_ID || '').trim();
+    const ownerStr = String(process.env.TELEGRAM_OWNER_IDS || '').trim();
     if (!ownerStr) return false;
-    const ownerIds = ownerStr.split(',').map(s => s.trim());
+    const ownerIds = ownerStr.split(',').map(s => s.trim()).filter(Boolean);
     return ownerIds.includes(String(userId).trim());
 }
 
@@ -439,16 +438,17 @@ const updateProg = async (chat, msgId, pct) => {
 };
 
 async function sendToTargets(message, opts) {
-    if (chatIdStr && chatIdStr !== 'your_chat_id_here') {
-        await bot.sendMessage(chatIdStr, message, opts).catch(() => {});
-    }
-    if (loggerGroupIdStr && loggerGroupIdStr !== 'your_logger_group_id_here') {
-        await bot.sendMessage(loggerGroupIdStr, message, opts).catch(() => {});
+    if (ownerIdsStr) {
+        const ids = ownerIdsStr.split(',').map(s => s.trim()).filter(Boolean);
+        for (const id of ids) {
+            const finalOpts = opts || { parse_mode: 'Markdown', ...getWelcomeMenu(id) };
+            await bot.sendMessage(id, message, finalOpts).catch(() => {});
+        }
     }
 }
 
 // Startup
-sendToTargets('🚂 Welcome to Rail Server', getWelcomeMenu(chatIdStr));
+sendToTargets('🚂 Welcome to Rail Server');
 console.log('🤖 Telegram Bot is running. Waiting for commands...');
 
 // ----------------------------------------------------
