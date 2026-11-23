@@ -17,5 +17,5 @@ RUN npx playwright install-deps firefox
 # Copy the rest of the application code
 COPY . .
 
-# Start the autonomous daemon 24/7
-CMD ["node", "auto_railway_daemon.js"]
+# Start master engine (Telegram Bot + Autonomous Daemon + HTTP Health Server)
+CMD ["node", "index.js"]

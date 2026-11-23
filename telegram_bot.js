@@ -454,12 +454,26 @@ console.log('🤖 Telegram Bot is running. Waiting for commands...');
 // ----------------------------------------------------
 // Command Handlers
 // ----------------------------------------------------
-bot.onText(/\/(start|rail)/, async (msg) => {
+bot.onText(/(^\/start|^\/rail|^start$|^rail$|^\/ping$|^\/help$)/i, async (msg) => {
     const chat = msg.chat.id;
     const userId = msg.from.id;
     const session = getSession(chat);
     session.state = 'IDLE';
-    await bot.sendMessage(chat, '🚂 Welcome to Rail Server', getWelcomeMenu(userId));
+
+    const isOwnerUser = isOwner(userId);
+    const welcomeText = `⚡ *Rail Server Bot Online & Ready!*\n\n` +
+        `👤 *Operator:* \`${msg.from.first_name || 'User'}\` (\`${userId}\`)\n` +
+        `🛡 *Role:* ${isOwnerUser ? '⭐️ *Authorized Owner*' : 'Regular Operator'}\n` +
+        `🟢 *Status:* Autonomous daemon active 24/7\n\n` +
+        `Select an action below to get started:`;
+
+    await bot.sendMessage(chat, welcomeText, {
+        parse_mode: 'Markdown',
+        ...getWelcomeMenu(userId)
+    }).catch(async (err) => {
+        console.error('Failed to send markdown welcome message:', err.message);
+        await bot.sendMessage(chat, '🚂 Rail Server Bot is Online! Choose an option:', getWelcomeMenu(userId)).catch(() => {});
+    });
 });
 
 bot.onText(/\/setup/, async (msg) => {

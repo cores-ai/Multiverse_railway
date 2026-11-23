@@ -2,9 +2,9 @@
   "name": "multiverse-railway-worker",
   "version": "1.0.0",
   "description": "Multiverse 24/7 Autonomous Railway Stealth Harvester & Daemon",
-  "main": "auto_railway_daemon.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node auto_railway_daemon.js",
+    "start": "node index.js",
     "daemon": "node auto_railway_daemon.js",
     "worker": "node account_worker.js",
     "delete": "node delete_worker.js",

@@ -21,7 +21,7 @@ const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
 const CLOUDFLARE_D1_DATABASE_ID = process.env.CLOUDFLARE_D1_DATABASE_ID;
 const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
 
-const HTTP_PORT = process.env.DAEMON_PORT || 4000;
+const HTTP_PORT = process.env.PORT || process.env.DAEMON_PORT || 4000;
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '4000', 10);
 
 let isAutomationActive = false;
@@ -533,8 +533,8 @@ function startHttpServer() {
     const server = http.createServer(async (req, res) => {
         const url = new URL(req.url, `http://${req.headers.host}`);
 
-        // Health check
-        if (req.method === 'GET' && url.pathname === '/health') {
+        // Health check (Supports root and /health for Railway deployment ping)
+        if (req.method === 'GET' && (url.pathname === '/health' || url.pathname === '/')) {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ status: 'ONLINE', isAutomationActive }));
             return;
