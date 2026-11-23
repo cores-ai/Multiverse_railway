@@ -46,14 +46,140 @@ async function saveD1RepoEnvs(repoName, envMap) {
     return count;
 }
 
-async function saveD1RepoDeployment(repoName, status = 'PENDING') {
+async function saveD1RepoDeployment(repoName, status = 'PENDING', userId = null) {
     if (!repoName) return;
     await queryD1(
-        `INSERT INTO repo_deployments (repo_name, deployment_status, created_at)
-         VALUES (?, ?, CURRENT_TIMESTAMP)
-         ON CONFLICT(repo_name) DO UPDATE SET deployment_status = excluded.deployment_status;`,
-        [repoName, status]
+        `INSERT INTO repo_deployments (repo_name, deployment_status, user_id, created_at)
+         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT(repo_name) DO UPDATE SET 
+            deployment_status = excluded.deployment_status,
+            user_id = COALESCE(excluded.user_id, repo_deployments.user_id);`,
+        [repoName, status, userId ? String(userId) : null]
     );
+}
+
+async function getUserRepos(userId, isOwner = false) {
+    const uStr = String(userId);
+    let sql;
+    let params;
+    if (isOwner) {
+        sql = 'SELECT repo_name, deployment_status, live_url, created_at, user_id FROM repo_deployments ORDER BY created_at DESC;';
+        params = [];
+    } else {
+        sql = 'SELECT repo_name, deployment_status, live_url, created_at, user_id FROM repo_deployments WHERE user_id = ? ORDER BY created_at DESC;';
+        params = [uStr];
+    }
+    return await queryD1(sql, params).catch(() => []);
+}
+
+async function getRepoDetails(repoName) {
+    const rows = await queryD1('SELECT repo_name, deployment_status, live_url, created_at, user_id FROM repo_deployments WHERE repo_name = ? LIMIT 1;', [repoName]).catch(() => []);
+    const envRows = await queryD1('SELECT env_key, env_value FROM repo_envs WHERE repo_name = ?;', [repoName]).catch(() => []);
+    
+    let ghData = null;
+    try {
+        const token = GITHUB_TOKEN;
+        const owner = await getGitHubOwner(token);
+        const ghRes = await fetch(`https://api.github.com/repos/${owner}/${repoName}`, {
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'User-Agent': 'Multiverse-Deploy-Bot',
+                'Accept': 'application/vnd.github.v3+json'
+            }
+        });
+        if (ghRes.ok) {
+            ghData = await ghRes.json();
+        }
+    } catch (e) {
+        console.warn('[getRepoDetails GitHub Warning]:', e.message);
+    }
+
+    return {
+        repoName,
+        deployment: rows[0] || null,
+        envsCount: envRows.length,
+        envs: envRows,
+        github: ghData ? {
+            fullName: ghData.full_name,
+            htmlUrl: ghData.html_url,
+            isPrivate: !!ghData.private,
+            defaultBranch: ghData.default_branch || 'main',
+            updatedAt: ghData.updated_at
+        } : null
+    };
+}
+
+async function toggleRepoVisibility(repoName) {
+    const token = GITHUB_TOKEN;
+    if (!token) throw new Error('GITHUB_TOKEN missing in .env');
+    const owner = await getGitHubOwner(token);
+
+    // 1. Get current status
+    const checkRes = await fetch(`https://api.github.com/repos/${owner}/${repoName}`, {
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'User-Agent': 'Multiverse-Deploy-Bot',
+            'Accept': 'application/vnd.github.v3+json'
+        }
+    });
+    if (!checkRes.ok) throw new Error(`Could not fetch repository from GitHub: ${checkRes.statusText}`);
+    const current = await checkRes.json();
+    const targetPrivate = !current.private;
+
+    // 2. Patch visibility
+    const patchRes = await fetch(`https://api.github.com/repos/${owner}/${repoName}`, {
+        method: 'PATCH',
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'User-Agent': 'Multiverse-Deploy-Bot',
+            'Content-Type': 'application/json',
+            'Accept': 'application/vnd.github.v3+json'
+        },
+        body: JSON.stringify({ private: targetPrivate })
+    });
+    if (!patchRes.ok) {
+        const errJson = await patchRes.json().catch(() => ({}));
+        throw new Error(`Failed to update visibility: ${errJson.message || patchRes.statusText}`);
+    }
+    return { isPrivate: targetPrivate, repoUrl: current.html_url };
+}
+
+async function deleteRepoFromGitHubAndD1(repoName) {
+    const token = GITHUB_TOKEN;
+    let ghDeleted = false;
+    let ghMessage = '';
+
+    if (token) {
+        try {
+            const owner = await getGitHubOwner(token);
+            const delRes = await fetch(`https://api.github.com/repos/${owner}/${repoName}`, {
+                method: 'DELETE',
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'User-Agent': 'Multiverse-Deploy-Bot',
+                    'Accept': 'application/vnd.github.v3+json'
+                }
+            });
+            if (delRes.status === 204 || delRes.status === 404) {
+                ghDeleted = true;
+            } else {
+                const errJson = await delRes.json().catch(() => ({}));
+                ghMessage = errJson.message || `HTTP ${delRes.status}`;
+            }
+        } catch (ghErr) {
+            ghMessage = ghErr.message;
+        }
+    }
+
+    // Delete from D1
+    await queryD1('DELETE FROM repo_deployments WHERE repo_name = ?;', [repoName]).catch(() => {});
+    await queryD1('DELETE FROM repo_envs WHERE repo_name = ?;', [repoName]).catch(() => {});
+
+    return { success: true, ghDeleted, ghMessage };
+}
+
+async function clearRepoEnvs(repoName) {
+    return await queryD1('DELETE FROM repo_envs WHERE repo_name = ?;', [repoName]);
 }
 
 // ----------------------------------------------------
@@ -538,5 +664,10 @@ module.exports = {
     extractAndPurgeRepoZip,
     pushFilesToGitHub,
     downloadGitHubRepoZip,
-    downloadTelegramFileBuffer
+    downloadTelegramFileBuffer,
+    getUserRepos,
+    getRepoDetails,
+    toggleRepoVisibility,
+    deleteRepoFromGitHubAndD1,
+    clearRepoEnvs
 };

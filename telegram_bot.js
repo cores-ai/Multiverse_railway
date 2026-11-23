@@ -14,7 +14,12 @@ const {
     extractAndPurgeRepoZip,
     pushFilesToGitHub,
     downloadGitHubRepoZip,
-    downloadTelegramFileBuffer
+    downloadTelegramFileBuffer,
+    getUserRepos,
+    getRepoDetails,
+    toggleRepoVisibility,
+    deleteRepoFromGitHubAndD1,
+    clearRepoEnvs
 } = require('./deploy_pipeline');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -289,7 +294,8 @@ function clearDirectorySafe(dirPath) {
 function getWelcomeMenu(userId) {
     const buttons = [
         [
-            { text: '🚀 Deploy App', callback_data: 'action_deploy_app' }
+            { text: '🚀 Deploy App', callback_data: 'action_deploy_app' },
+            { text: '📦 My Repos', callback_data: 'menu_my_repos' }
         ],
         [
             { text: '🛠 Custom Build', callback_data: 'menu_custom_build' }
@@ -554,6 +560,15 @@ bot.onText(/\/(deploy|deployapp)/i, async (msg) => {
     ).catch(() => {});
 });
 
+bot.onText(/\/(repos|myrepos)/i, async (msg) => {
+    const chat = msg.chat.id;
+    const userId = msg.from.id;
+    const session = getSession(chat);
+    session.state = 'IDLE';
+    session.deployStaging = null;
+    await showMyReposMenu(chat, null, userId);
+});
+
 async function triggerAutonomousDeletionForChat(chat, targetEmail, statusMsgId = null) {
     const session = getSession(chat);
     let msgId = statusMsgId;
@@ -767,7 +782,238 @@ bot.on('callback_query', async (query) => {
             await bot.sendMessage(chat, '⚠️ No pending repository staging found. Please start over from Deploy App.', getWelcomeMenu(userId));
             return;
         }
-        await executeDeployPush(chat, session, {});
+        await executeDeployPush(chat, session, {}, session.targetUpdateRepo, userId);
+        return;
+    }
+
+    // ----------------------------------------------------
+    // My Repositories & Management Callbacks
+    // ----------------------------------------------------
+    if (action === 'menu_my_repos') {
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        const session = getSession(chat);
+        session.state = 'IDLE';
+        session.deployStaging = null;
+        session.targetUpdateRepo = null;
+        await showMyReposMenu(chat, msgId, userId);
+        return;
+    }
+
+    if (action.startsWith('repo_view_')) {
+        const repoName = action.replace('repo_view_', '');
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        const session = getSession(chat);
+        session.state = 'IDLE';
+        session.deployStaging = null;
+        session.targetUpdateRepo = null;
+        await showRepoDashboard(chat, msgId, repoName, userId);
+        return;
+    }
+
+    if (action.startsWith('repo_vis_')) {
+        const repoName = action.replace('repo_vis_', '');
+        await bot.answerCallbackQuery(query.id, { text: '🔄 Updating visibility...' }).catch(() => {});
+        try {
+            const res = await toggleRepoVisibility(repoName);
+            await bot.answerCallbackQuery(query.id, {
+                text: res.isPrivate ? '🔒 Repository is now PRIVATE' : '🌐 Repository is now PUBLIC',
+                show_alert: true
+            }).catch(() => {});
+            await showRepoDashboard(chat, msgId, repoName, userId);
+        } catch (err) {
+            await bot.answerCallbackQuery(query.id, { text: `❌ Error: ${err.message}`, show_alert: true }).catch(() => {});
+        }
+        return;
+    }
+
+    if (action.startsWith('repo_deploy_')) {
+        const repoName = action.replace('repo_deploy_', '');
+        await bot.answerCallbackQuery(query.id, {
+            text: `🚂 Railway Auto-Deployment for "${repoName}" is scheduled for Phase 2.\nRepository codebase & D1 secrets are fully synced and ready!`,
+            show_alert: true
+        }).catch(() => {});
+        return;
+    }
+
+    if (action.startsWith('repo_del_ask_')) {
+        const repoName = action.replace('repo_del_ask_', '');
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        await bot.editMessageText(
+            `⚠️ *Are you sure you want to permanently delete repository:* \`${repoName}\`?\n\n` +
+            `• The repository will be deleted from GitHub.\n` +
+            `• All environment secrets in Cloudflare D1 will be purged.\n` +
+            `• Deployment status will be erased.\n\n` +
+            `*This action cannot be undone!*`,
+            {
+                chat_id: chat,
+                message_id: msgId,
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🗑️ Yes, Delete Permanently', callback_data: `repo_del_yes_${repoName}` }],
+                        [{ text: '❌ Cancel (Keep Repo)', callback_data: `repo_view_${repoName}` }]
+                    ]
+                }
+            }
+        ).catch(() => {});
+        return;
+    }
+
+    if (action.startsWith('repo_del_yes_')) {
+        const repoName = action.replace('repo_del_yes_', '');
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        const delWait = await bot.sendMessage(chat, `⏳ *Deleting repository \`${repoName}\` from GitHub & Cloudflare D1...*`, { parse_mode: 'Markdown' });
+        try {
+            const res = await deleteRepoFromGitHubAndD1(repoName);
+            await bot.editMessageText(`✅ Repository \`${repoName}\` has been permanently deleted from GitHub and Cloudflare D1.`, {
+                chat_id: chat,
+                message_id: delWait.message_id,
+                parse_mode: 'Markdown'
+            }).catch(() => {});
+            await showMyReposMenu(chat, null, userId);
+        } catch (err) {
+            await bot.editMessageText(`❌ Failed to delete repository: ${err.message}`, {
+                chat_id: chat,
+                message_id: delWait.message_id
+            }).catch(() => {});
+        }
+        return;
+    }
+
+    if (action.startsWith('repo_env_add_')) {
+        const repoName = action.replace('repo_env_add_', '');
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        const session = getSession(chat);
+        session.state = 'WAITING_ENV_UPDATE';
+        session.targetRepo = repoName;
+        await bot.editMessageText(
+            `🔐 *Update Environment Variables for \`${repoName}\`*\n\n` +
+            `Please send your environment variables:\n` +
+            `• Direct text message with \`KEY=VALUE\` lines, OR\n` +
+            `• Upload a \`.env\` file document.\n\n` +
+            `Variables will be safely encrypted & stored in Cloudflare D1.`,
+            {
+                chat_id: chat,
+                message_id: msgId,
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔙 Cancel', callback_data: `repo_env_${repoName}` }]
+                    ]
+                }
+            }
+        ).catch(() => {});
+        return;
+    }
+
+    if (action.startsWith('repo_env_clear_ask_')) {
+        const repoName = action.replace('repo_env_clear_ask_', '');
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        await bot.editMessageText(
+            `⚠️ *Are you sure you want to clear all environment secrets for \`${repoName}\` from Cloudflare D1?*`,
+            {
+                chat_id: chat,
+                message_id: msgId,
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🗑️ Yes, Clear All Secrets', callback_data: `repo_env_clear_yes_${repoName}` }],
+                        [{ text: '❌ Cancel', callback_data: `repo_env_${repoName}` }]
+                    ]
+                }
+            }
+        ).catch(() => {});
+        return;
+    }
+
+    if (action.startsWith('repo_env_clear_yes_')) {
+        const repoName = action.replace('repo_env_clear_yes_', '');
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        await clearRepoEnvs(repoName);
+        await bot.sendMessage(chat, `✅ Cleared all environment secrets for \`${repoName}\` from Cloudflare D1.`);
+        await showRepoEnvMenu(chat, null, repoName);
+        return;
+    }
+
+    if (action.startsWith('repo_env_')) {
+        const repoName = action.replace('repo_env_', '');
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        await showRepoEnvMenu(chat, msgId, repoName);
+        return;
+    }
+
+    if (action.startsWith('repo_edit_')) {
+        const repoName = action.replace('repo_edit_', '');
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        await bot.editMessageText(
+            `✏️ *Update Codebase: \`${repoName}\`*\n\n` +
+            `Choose how your updated repository files and environment configuration are provided:\n\n` +
+            `• *📦 Merged Update:* Upload new \`.zip\` archive containing updated code and \`.env\`.\n` +
+            `• *📑 Separated Update:* First upload new \`.zip\` archive (or GitHub link), then provide \`.env\` separately in Step 2.`,
+            {
+                chat_id: chat,
+                message_id: msgId,
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '📦 Merged Update (.env inside repo)', callback_data: `repo_up_merged_${repoName}` }],
+                        [{ text: '📑 Separated Update (.env separate)', callback_data: `repo_up_sep_${repoName}` }],
+                        [{ text: '🔙 Back to Repo Dashboard', callback_data: `repo_view_${repoName}` }]
+                    ]
+                }
+            }
+        ).catch(() => {});
+        return;
+    }
+
+    if (action.startsWith('repo_up_merged_')) {
+        const repoName = action.replace('repo_up_merged_', '');
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        const session = getSession(chat);
+        session.state = 'WAITING_REPO_UPDATE_MERGED';
+        session.targetUpdateRepo = repoName;
+        session.deployStaging = null;
+        await bot.editMessageText(
+            `📦 *Merged Codebase Update for \`${repoName}\`*\n\n` +
+            `Please upload your updated repository as a \`.zip\` archive document.\n\n` +
+            `🛡️ *Nuclear Security Shield:*\n` +
+            `Any \`.env\` files will be extracted, stored in Cloudflare D1, and purged before updating GitHub!`,
+            {
+                chat_id: chat,
+                message_id: msgId,
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔙 Cancel', callback_data: `repo_edit_${repoName}` }]
+                    ]
+                }
+            }
+        ).catch(() => {});
+        return;
+    }
+
+    if (action.startsWith('repo_up_sep_')) {
+        const repoName = action.replace('repo_up_sep_', '');
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        const session = getSession(chat);
+        session.state = 'WAITING_REPO_UPDATE_SEP';
+        session.targetUpdateRepo = repoName;
+        session.deployStaging = null;
+        await bot.editMessageText(
+            `📑 *Separated Codebase Update for \`${repoName}\` (Step 1 of 2)*\n\n` +
+            `Please upload your updated repository as a \`.zip\` archive document, or send a public GitHub repository link:\n\n` +
+            `ℹ️ Keep your \`.env\` separate — you will be prompted for it in Step 2.`,
+            {
+                chat_id: chat,
+                message_id: msgId,
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔙 Cancel', callback_data: `repo_edit_${repoName}` }]
+                    ]
+                }
+            }
+        ).catch(() => {});
         return;
     }
 
@@ -1522,22 +1768,180 @@ async function submitOtpAndHarvestToken(chat, statusMsgId, otp) {
 }
 
 // ----------------------------------------------------
+// Repositories Management UI Engine
+// ----------------------------------------------------
+async function showMyReposMenu(chat, msgId, userId) {
+    const isOwnerUser = isOwner(userId);
+    const repos = await getUserRepos(userId, isOwnerUser);
+
+    if (!repos || repos.length === 0) {
+        const emptyText = `📦 *My Repositories*\n\nYou haven't deployed any repositories yet. Use the button below to deploy your first application:`;
+        const opts = {
+            chat_id: chat,
+            message_id: msgId,
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '🚀 Deploy App', callback_data: 'action_deploy_app' }],
+                    [{ text: '🔙 Back to Menu', callback_data: 'menu_main' }]
+                ]
+            }
+        };
+        if (msgId) {
+            await bot.editMessageText(emptyText, opts).catch(async () => {
+                await bot.sendMessage(chat, emptyText, { parse_mode: opts.parse_mode, reply_markup: opts.reply_markup }).catch(() => {});
+            });
+        } else {
+            await bot.sendMessage(chat, emptyText, { parse_mode: opts.parse_mode, reply_markup: opts.reply_markup }).catch(() => {});
+        }
+        return;
+    }
+
+    const header = isOwnerUser 
+        ? `📦 *Repositories Dashboard (Owner View)*\nFound *${repos.length}* total repositories:` 
+        : `📦 *My Repositories*\nYou have deployed *${repos.length}* repository:`;
+
+    const rows = [];
+    for (const r of repos) {
+        const icon = r.deployment_status === 'ACTIVE' ? '🟢' : '🟡';
+        rows.push([
+            { text: `📁 ${r.repo_name} (${icon} ${r.deployment_status || 'PENDING'})`, callback_data: `repo_view_${r.repo_name}` }
+        ]);
+    }
+    rows.push([
+        { text: '🚀 Deploy New App', callback_data: 'action_deploy_app' },
+        { text: '🔙 Back to Menu', callback_data: 'menu_main' }
+    ]);
+
+    const opts = {
+        chat_id: chat,
+        message_id: msgId,
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: rows }
+    };
+
+    if (msgId) {
+        await bot.editMessageText(header, opts).catch(async () => {
+            await bot.sendMessage(chat, header, { parse_mode: opts.parse_mode, reply_markup: opts.reply_markup }).catch(() => {});
+        });
+    } else {
+        await bot.sendMessage(chat, header, { parse_mode: opts.parse_mode, reply_markup: opts.reply_markup }).catch(() => {});
+    }
+}
+
+async function showRepoDashboard(chat, msgId, repoName, userId) {
+    const details = await getRepoDetails(repoName);
+    const dep = details.deployment || {};
+    const gh = details.github || {};
+
+    const visText = gh.isPrivate ? '🔒 Private' : '🌐 Public';
+    const visToggleBtnText = gh.isPrivate ? '🌐 Make Public' : '🔒 Make Private';
+    const statusText = dep.deployment_status || 'PENDING';
+    const liveUrlText = dep.live_url ? `\n🌍 *Live URL:* ${dep.live_url}` : '';
+
+    const text = 
+        `📁 *Repository Dashboard: \`${repoName}\`*\n\n` +
+        `🌐 *GitHub:* [${gh.fullName || repoName}](${gh.htmlUrl || `https://github.com/Coras-Multiverse/${repoName}`})\n` +
+        `🔒 *Visibility:* \`${visText}\`\n` +
+        `⚡ *Deployment Status:* \`${statusText}\`${liveUrlText}\n` +
+        `🔐 *Environment Secrets:* \`${details.envsCount} variables in D1\`\n` +
+        `📅 *Created:* \`${dep.created_at || 'Recently'}\`\n\n` +
+        `*Select an action below:*`;
+
+    const buttons = [
+        [
+            { text: '✏️ Edit Repo (Update Code)', callback_data: `repo_edit_${repoName}` }
+        ],
+        [
+            { text: visToggleBtnText, callback_data: `repo_vis_${repoName}` },
+            { text: '🔐 Manage .env', callback_data: `repo_env_${repoName}` }
+        ],
+        [
+            { text: '🚀 Deploy', callback_data: `repo_deploy_${repoName}` },
+            { text: '🔗 Open GitHub', url: gh.htmlUrl || `https://github.com/Coras-Multiverse/${repoName}` }
+        ],
+        [
+            { text: '🗑️ Delete Repo', callback_data: `repo_del_ask_${repoName}` }
+        ],
+        [
+            { text: '🔙 Back to Repos', callback_data: 'menu_my_repos' }
+        ]
+    ];
+
+    const opts = {
+        chat_id: chat,
+        message_id: msgId,
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: buttons }
+    };
+
+    if (msgId) {
+        await bot.editMessageText(text, opts).catch(async () => {
+            await bot.sendMessage(chat, text, { parse_mode: opts.parse_mode, disable_web_page_preview: true, reply_markup: opts.reply_markup }).catch(() => {});
+        });
+    } else {
+        await bot.sendMessage(chat, text, { parse_mode: opts.parse_mode, disable_web_page_preview: true, reply_markup: opts.reply_markup }).catch(() => {});
+    }
+}
+
+async function showRepoEnvMenu(chat, msgId, repoName) {
+    const details = await getRepoDetails(repoName);
+    const envs = details.envs || [];
+
+    let envListStr = '';
+    if (envs.length === 0) {
+        envListStr = '_(No environment variables configured yet)_';
+    } else {
+        envListStr = envs.map(e => `• \`${e.env_key}\`: \`${e.env_value ? (e.env_value.length > 8 ? e.env_value.substring(0, 4) + '••••' : '••••') : 'empty'}\``).join('\n');
+    }
+
+    const text = 
+        `🔐 *Environment Secrets: \`${repoName}\`*\n\n` +
+        `*Stored in Cloudflare D1 (\`repo_envs\`):*\n${envListStr}\n\n` +
+        `You can update existing keys or add new environment variables below:`;
+
+    const buttons = [
+        [{ text: '➕ Add / Update .env Variables', callback_data: `repo_env_add_${repoName}` }],
+        [{ text: '🗑️ Clear All .env Secrets', callback_data: `repo_env_clear_ask_${repoName}` }],
+        [{ text: '🔙 Back to Repo Dashboard', callback_data: `repo_view_${repoName}` }]
+    ];
+
+    const opts = {
+        chat_id: chat,
+        message_id: msgId,
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: buttons }
+    };
+
+    if (msgId) {
+        await bot.editMessageText(text, opts).catch(async () => {
+            await bot.sendMessage(chat, text, { parse_mode: opts.parse_mode, reply_markup: opts.reply_markup }).catch(() => {});
+        });
+    } else {
+        await bot.sendMessage(chat, text, { parse_mode: opts.parse_mode, reply_markup: opts.reply_markup }).catch(() => {});
+    }
+}
+
+// ----------------------------------------------------
 // Core Deploy App Pipeline Execution
 // ----------------------------------------------------
-async function executeDeployPush(chat, session, additionalEnvs = {}) {
+async function executeDeployPush(chat, session, additionalEnvs = {}, targetRepoOverride = null, userId = null) {
     const staging = session.deployStaging;
     if (!staging || !staging.files || staging.files.length === 0) {
         session.state = 'IDLE';
         session.deployStaging = null;
+        session.targetUpdateRepo = null;
         await bot.sendMessage(chat, '❌ No files found to deploy. Please upload a valid .zip repository archive.');
         return;
     }
 
-    const repoName = staging.repoName;
+    const repoName = targetRepoOverride || staging.repoName;
     const allEnvs = { ...(staging.extractedEnvs || {}), ...(additionalEnvs || {}) };
     const envKeys = Object.keys(allEnvs);
+    const resolvedUserId = userId || session.userId || chat;
 
-    const progressMsg = await bot.sendMessage(chat, '⏳ *Initiating Deployment Pipeline...*\n`[░░░░░░░░░░]` *0%*', { parse_mode: 'Markdown' });
+    const progressMsg = await bot.sendMessage(chat, `⏳ *Initiating Deployment Pipeline for \`${repoName}\`...*\n\`[░░░░░░░░░░]\` *0%*`, { parse_mode: 'Markdown' });
 
     try {
         // Step 1: Save Environment Variables to Cloudflare D1
@@ -1553,9 +1957,9 @@ async function executeDeployPush(chat, session, additionalEnvs = {}) {
             }).catch(() => {});
 
             envSavedCount = await saveD1RepoEnvs(repoName, allEnvs);
-            await saveD1RepoDeployment(repoName, 'PENDING');
+            await saveD1RepoDeployment(repoName, 'PENDING', resolvedUserId);
         } else {
-            await saveD1RepoDeployment(repoName, 'PENDING');
+            await saveD1RepoDeployment(repoName, 'PENDING', resolvedUserId);
         }
 
         // Step 2: Push Sanitized Codebase to GitHub
@@ -1597,6 +2001,7 @@ async function executeDeployPush(chat, session, additionalEnvs = {}) {
             disable_web_page_preview: true,
             reply_markup: {
                 inline_keyboard: [
+                    [{ text: '📁 Manage This Repo', callback_data: `repo_view_${repoName}` }],
                     [{ text: '🔗 Open GitHub Repository', url: pushResult.repoUrl }],
                     [{ text: '🚀 Deploy Another App', callback_data: 'action_deploy_app' }],
                     [{ text: '🔙 Main Menu', callback_data: 'menu_main' }]
@@ -1625,6 +2030,7 @@ async function executeDeployPush(chat, session, additionalEnvs = {}) {
     } finally {
         session.state = 'IDLE';
         session.deployStaging = null;
+        session.targetUpdateRepo = null;
     }
 }
 
@@ -1661,7 +2067,7 @@ bot.on('message', async (msg) => {
                 session.deployStaging = processed;
 
                 await bot.deleteMessage(chat, waitMsg.message_id).catch(() => {});
-                await executeDeployPush(chat, session, {});
+                await executeDeployPush(chat, session, {}, null, userId);
             } catch (err) {
                 console.error('[Merged Flow Error]:', err);
                 await bot.editMessageText(`❌ Failed to process archive: ${err.message}`, {
@@ -1670,6 +2076,34 @@ bot.on('message', async (msg) => {
                 }).catch(() => {});
                 session.state = 'IDLE';
                 session.deployStaging = null;
+            }
+            return;
+        }
+
+        // 1b. Merged Repo Update Flow
+        if (session.state === 'WAITING_REPO_UPDATE_MERGED') {
+            if (!fileName.toLowerCase().endsWith('.zip')) {
+                await bot.sendMessage(chat, '⚠️ Please upload a valid `.zip` repository archive file.');
+                return;
+            }
+            const targetRepo = session.targetUpdateRepo;
+            const waitMsg = await bot.sendMessage(chat, `📥 *Downloading and analyzing update archive for \`${targetRepo}\`...*`, { parse_mode: 'Markdown' });
+            try {
+                const zipBuffer = await downloadTelegramFileBuffer(bot, doc.file_id);
+                const processed = extractAndPurgeRepoZip(zipBuffer, targetRepo);
+                session.deployStaging = processed;
+
+                await bot.deleteMessage(chat, waitMsg.message_id).catch(() => {});
+                await executeDeployPush(chat, session, {}, targetRepo, userId);
+            } catch (err) {
+                console.error('[Update Merged Flow Error]:', err);
+                await bot.editMessageText(`❌ Failed to process update archive: ${err.message}`, {
+                    chat_id: chat,
+                    message_id: waitMsg.message_id
+                }).catch(() => {});
+                session.state = 'IDLE';
+                session.deployStaging = null;
+                session.targetUpdateRepo = null;
             }
             return;
         }
@@ -1724,6 +2158,57 @@ bot.on('message', async (msg) => {
             return;
         }
 
+        // 2b. Separated Repo Update Flow (Step 1)
+        if (session.state === 'WAITING_REPO_UPDATE_SEP') {
+            if (!fileName.toLowerCase().endsWith('.zip')) {
+                await bot.sendMessage(chat, '⚠️ Please upload a valid `.zip` repository archive file or send a GitHub URL.');
+                return;
+            }
+            const targetRepo = session.targetUpdateRepo;
+            const waitMsg = await bot.sendMessage(chat, `📥 *Downloading and analyzing update archive for \`${targetRepo}\`...*`, { parse_mode: 'Markdown' });
+            try {
+                const zipBuffer = await downloadTelegramFileBuffer(bot, doc.file_id);
+                const processed = extractAndPurgeRepoZip(zipBuffer, targetRepo);
+                session.deployStaging = processed;
+                session.state = 'WAITING_ENV_SEP';
+
+                let envNote = '';
+                if (processed.strippedEnvFiles.length > 0) {
+                    envNote = `\n\n🛡️ *Security Shield:* Found and extracted \`${processed.strippedEnvFiles.map(s => s.path).join(', ')}\` (${Object.keys(processed.extractedEnvs).length} variables saved to Cloudflare D1 staging).`;
+                }
+
+                await bot.editMessageText(
+                    `📑 *Separated Codebase Update for \`${targetRepo}\` (Step 2 of 2)*\n\n` +
+                    `Repository update received: *${targetRepo}* (${processed.totalFiles} files).${envNote}\n\n` +
+                    `Now please provide your updated \`.env\` configuration:\n` +
+                    `• Send your \`.env\` content directly as a text message, OR\n` +
+                    `• Upload a \`.env\` file document.\n\n` +
+                    `*(Or click "⏩ Skip .env" to keep existing or skip)*`,
+                    {
+                        chat_id: chat,
+                        message_id: waitMsg.message_id,
+                        parse_mode: 'Markdown',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{ text: '⏩ Skip .env', callback_data: 'deploy_skip_env_sep' }],
+                                [{ text: '🔙 Cancel', callback_data: `repo_view_${targetRepo}` }]
+                            ]
+                        }
+                    }
+                ).catch(() => {});
+            } catch (err) {
+                console.error('[Update Separated Flow Error]:', err);
+                await bot.editMessageText(`❌ Failed to process update archive: ${err.message}`, {
+                    chat_id: chat,
+                    message_id: waitMsg.message_id
+                }).catch(() => {});
+                session.state = 'IDLE';
+                session.deployStaging = null;
+                session.targetUpdateRepo = null;
+            }
+            return;
+        }
+
         // 3. Separated Deployment Flow (Step 2: .env File Upload)
         if (session.state === 'WAITING_ENV_SEP') {
             const waitMsg = await bot.sendMessage(chat, '📥 *Processing .env file...*', { parse_mode: 'Markdown' });
@@ -1733,7 +2218,7 @@ bot.on('message', async (msg) => {
                 const envMap = parseEnvContent(textContent);
 
                 await bot.deleteMessage(chat, waitMsg.message_id).catch(() => {});
-                await executeDeployPush(chat, session, envMap);
+                await executeDeployPush(chat, session, envMap, session.targetUpdateRepo, userId);
             } catch (err) {
                 console.error('[Env File Error]:', err);
                 await bot.editMessageText(`❌ Failed to read .env file: ${err.message}`, {
@@ -1743,17 +2228,48 @@ bot.on('message', async (msg) => {
             }
             return;
         }
+
+        // 4. Standalone Environment Update Upload
+        if (session.state === 'WAITING_ENV_UPDATE') {
+            const targetRepo = session.targetRepo;
+            const waitMsg = await bot.sendMessage(chat, '📥 *Processing .env file...*', { parse_mode: 'Markdown' });
+            try {
+                const envBuffer = await downloadTelegramFileBuffer(bot, doc.file_id);
+                const textContent = envBuffer.toString('utf8');
+                const envMap = parseEnvContent(textContent);
+                const count = await saveD1RepoEnvs(targetRepo, envMap);
+                await bot.editMessageText(`✅ Successfully stored *${count}* environment variables for \`${targetRepo}\` in Cloudflare D1 (\`repo_envs\`).`, {
+                    chat_id: chat,
+                    message_id: waitMsg.message_id,
+                    parse_mode: 'Markdown'
+                }).catch(() => {});
+                session.state = 'IDLE';
+                session.targetRepo = null;
+                await showRepoEnvMenu(chat, null, targetRepo);
+            } catch (err) {
+                await bot.editMessageText(`❌ Failed to update .env: ${err.message}`, {
+                    chat_id: chat,
+                    message_id: waitMsg.message_id
+                }).catch(() => {});
+                session.state = 'IDLE';
+            }
+            return;
+        }
     }
 
     // ----------------------------------------------------
     // Text Inputs for Deploy App
     // ----------------------------------------------------
-    if (session.state === 'WAITING_REPO_SEP') {
+    if (session.state === 'WAITING_REPO_SEP' || session.state === 'WAITING_REPO_UPDATE_SEP') {
+        const isUpdate = session.state === 'WAITING_REPO_UPDATE_SEP';
+        const targetRepoHint = isUpdate ? session.targetUpdateRepo : '';
+
         if (text.includes('github.com')) {
             const waitMsg = await bot.sendMessage(chat, '📥 *Fetching repository from GitHub...*', { parse_mode: 'Markdown' });
             try {
                 const { buffer, repoName } = await downloadGitHubRepoZip(text);
-                const processed = extractAndPurgeRepoZip(buffer, repoName);
+                const finalRepoName = targetRepoHint || repoName;
+                const processed = extractAndPurgeRepoZip(buffer, finalRepoName);
                 session.deployStaging = processed;
                 session.state = 'WAITING_ENV_SEP';
 
@@ -1764,11 +2280,11 @@ bot.on('message', async (msg) => {
 
                 await bot.editMessageText(
                     `📑 *Separated Deployment (Step 2 of 2)*\n\n` +
-                    `Repository fetched: *${processed.repoName}* (${processed.totalFiles} files).${envNote}\n\n` +
+                    `Repository ${isUpdate ? 'update ' : ''}fetched: *${processed.repoName}* (${processed.totalFiles} files).${envNote}\n\n` +
                     `Now please provide your \`.env\` configuration:\n` +
                     `• Send your \`.env\` content directly as a text message, OR\n` +
                     `• Upload a \`.env\` file document.\n\n` +
-                    `*(Or click "⏩ Skip .env" if this app requires no environment variables)*`,
+                    `*(Or click "⏩ Skip .env" ${isUpdate ? 'to keep existing or skip' : 'if this app requires no environment variables'})*`,
                     {
                         chat_id: chat,
                         message_id: waitMsg.message_id,
@@ -1776,7 +2292,7 @@ bot.on('message', async (msg) => {
                         reply_markup: {
                             inline_keyboard: [
                                 [{ text: '⏩ Skip .env', callback_data: 'deploy_skip_env_sep' }],
-                                [{ text: '🔙 Cancel', callback_data: 'action_deploy_app' }]
+                                [{ text: '🔙 Cancel', callback_data: isUpdate ? `repo_view_${finalRepoName}` : 'action_deploy_app' }]
                             ]
                         }
                     }
@@ -1798,10 +2314,26 @@ bot.on('message', async (msg) => {
     if (session.state === 'WAITING_ENV_SEP') {
         if (text.includes('=')) {
             const envMap = parseEnvContent(text);
-            await executeDeployPush(chat, session, envMap);
+            await executeDeployPush(chat, session, envMap, session.targetUpdateRepo, userId);
             return;
         } else {
             await bot.sendMessage(chat, '⚠️ Please send valid `.env` variables with `KEY=VALUE` pairs, or click "⏩ Skip .env".');
+            return;
+        }
+    }
+
+    if (session.state === 'WAITING_ENV_UPDATE') {
+        if (text.includes('=')) {
+            const targetRepo = session.targetRepo;
+            const envMap = parseEnvContent(text);
+            const count = await saveD1RepoEnvs(targetRepo, envMap);
+            await bot.sendMessage(chat, `✅ Successfully stored *${count}* environment variables for \`${targetRepo}\` in Cloudflare D1 (\`repo_envs\`).`, { parse_mode: 'Markdown' });
+            session.state = 'IDLE';
+            session.targetRepo = null;
+            await showRepoEnvMenu(chat, null, targetRepo);
+            return;
+        } else {
+            await bot.sendMessage(chat, '⚠️ Please send valid `.env` variables with `KEY=VALUE` pairs (e.g. `PORT=3000`).');
             return;
         }
     }
