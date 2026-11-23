@@ -210,6 +210,19 @@ async function ensureGitHubRepo(token, owner, repoName) {
 
     if (checkRes.ok) {
         const repo = await checkRes.json();
+        // If repo is private, make it public so URLs open directly without 404
+        if (repo.private) {
+            await fetch(`https://api.github.com/repos/${owner}/${repoName}`, {
+                method: 'PATCH',
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'User-Agent': 'Multiverse-Deploy-Bot',
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/vnd.github.v3+json'
+                },
+                body: JSON.stringify({ private: false })
+            }).catch(() => {});
+        }
         return { created: false, defaultBranch: repo.default_branch || 'main' };
     }
 
@@ -225,7 +238,7 @@ async function ensureGitHubRepo(token, owner, repoName) {
             body: JSON.stringify({
                 name: repoName,
                 description: `Multiverse Deploy App - ${repoName}`,
-                private: true,
+                private: false,
                 auto_init: true
             })
         });
