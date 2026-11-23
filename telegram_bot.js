@@ -7,6 +7,14 @@ const spoofConfig = require('./spoof_config');
 const { generateStealthScript } = require('./stealth_injections');
 const { harvestRailwayApiToken, dispatchTokenToMiddleman, handleRailwayTermsOfService, deleteCurrentRailwayAccount } = require('./token_harvester');
 const { generateTempEmail, fetchRawOtp } = require('./tempmail_client');
+const {
+    saveD1RepoEnvs,
+    saveD1RepoDeployment,
+    parseEnvContent,
+    extractAndPurgeRepoZip,
+    pushFilesToGitHub,
+    downloadGitHubRepoZip
+} = require('./deploy_pipeline');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const ownerIdsStr = process.env.TELEGRAM_OWNER_IDS || '';
@@ -280,8 +288,10 @@ function clearDirectorySafe(dirPath) {
 function getWelcomeMenu(userId) {
     const buttons = [
         [
-            { text: '🚀 Auto Build', callback_data: 'action_autobuild' },
-            { text: '🛠 Custom', callback_data: 'action_custom' }
+            { text: '🚀 Deploy App', callback_data: 'action_deploy_app' }
+        ],
+        [
+            { text: '🛠 Custom Build', callback_data: 'menu_custom_build' }
         ]
     ];
 
@@ -294,6 +304,40 @@ function getWelcomeMenu(userId) {
     return {
         reply_markup: {
             inline_keyboard: buttons
+        }
+    };
+}
+
+function getCustomBuildMenu() {
+    return {
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: '🚀 Auto Build', callback_data: 'action_autobuild' },
+                    { text: '🛠 Custom', callback_data: 'action_custom' }
+                ],
+                [
+                    { text: '🔙 Back to Menu', callback_data: 'menu_main' }
+                ]
+            ]
+        }
+    };
+}
+
+function getDeployAppMenu() {
+    return {
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: '📦 Merged (.env inside repo)', callback_data: 'deploy_env_merged' }
+                ],
+                [
+                    { text: '📑 Separated (.env separate)', callback_data: 'deploy_env_separated' }
+                ],
+                [
+                    { text: '🔙 Back to Menu', callback_data: 'menu_main' }
+                ]
+            ]
         }
     };
 }
@@ -311,11 +355,11 @@ function getAutoBuildMenu(isOwnerUser = false) {
     if (isOwnerUser) {
         rows.push([
             { text: '➕ Add Domain', callback_data: 'action_add_domain_ab' },
-            { text: '🔙 Back', callback_data: 'menu_main' }
+            { text: '🔙 Back', callback_data: 'menu_custom_build' }
         ]);
     } else {
         rows.push([
-            { text: '🔙 Back', callback_data: 'menu_main' }
+            { text: '🔙 Back', callback_data: 'menu_custom_build' }
         ]);
     }
 
@@ -491,6 +535,24 @@ bot.onText(/\/setup/, async (msg) => {
     await bot.sendMessage(chat, menu.text, menu.opts);
 });
 
+bot.onText(/\/(deploy|deployapp)/i, async (msg) => {
+    const chat = msg.chat.id;
+    const session = getSession(chat);
+    session.state = 'IDLE';
+    session.deployStaging = null;
+    await bot.sendMessage(
+        chat,
+        '🚀 *Deploy Application*\n\n' +
+        'Choose how your environment configuration (`.env`) is provided:\n\n' +
+        '• *📦 Merged:* Upload a single repository archive (`.zip`) containing code and `.env`. The system strictly purges `.env` from the codebase, stores secrets securely in Cloudflare D1, and pushes sanitized code to GitHub.\n\n' +
+        '• *📑 Separated:* First upload your repository (`.zip` or GitHub link), then provide your `.env` configuration separately in Step 2.',
+        {
+            parse_mode: 'Markdown',
+            ...getDeployAppMenu()
+        }
+    ).catch(() => {});
+});
+
 async function triggerAutonomousDeletionForChat(chat, targetEmail, statusMsgId = null) {
     const session = getSession(chat);
     let msgId = statusMsgId;
@@ -602,11 +664,109 @@ bot.on('callback_query', async (query) => {
         await bot.answerCallbackQuery(query.id).catch(() => {});
         const session = getSession(chat);
         session.state = 'IDLE';
+        session.deployStaging = null;
         await bot.editMessageText('🚂 Welcome to Rail Server', {
             chat_id: chat,
             message_id: msgId,
             ...getWelcomeMenu(userId)
         }).catch(() => {});
+        return;
+    }
+
+    // Navigation: Custom Build Submenu
+    if (action === 'menu_custom_build') {
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        const session = getSession(chat);
+        session.state = 'IDLE';
+        session.deployStaging = null;
+        await bot.editMessageText('🛠 *Custom Build Suite*\n\nSelect an autonomous builder mode:', {
+            chat_id: chat,
+            message_id: msgId,
+            parse_mode: 'Markdown',
+            ...getCustomBuildMenu()
+        }).catch(() => {});
+        return;
+    }
+
+    // Navigation: Deploy App Choices
+    if (action === 'action_deploy_app') {
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        const session = getSession(chat);
+        session.state = 'IDLE';
+        session.deployStaging = null;
+        await bot.editMessageText(
+            '🚀 *Deploy Application Pipeline*\n\n' +
+            'Choose how your environment configuration (`.env`) is provided:\n\n' +
+            '• *📦 Merged:* Upload a single repository archive (`.zip`) containing code and `.env`. The system strictly purges `.env` from the codebase, stores secrets securely in Cloudflare D1, and pushes sanitized code to GitHub.\n\n' +
+            '• *📑 Separated:* First upload your repository (`.zip` or GitHub link), then provide your `.env` configuration separately in Step 2.',
+            {
+                chat_id: chat,
+                message_id: msgId,
+                parse_mode: 'Markdown',
+                ...getDeployAppMenu()
+            }
+        ).catch(() => {});
+        return;
+    }
+
+    // Deploy App: Merged Flow
+    if (action === 'deploy_env_merged') {
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        const session = getSession(chat);
+        session.state = 'WAITING_REPO_MERGED';
+        session.deployStaging = null;
+        await bot.editMessageText(
+            '📦 *Merged Deployment Pipeline*\n\n' +
+            'Please upload your repository as a `.zip` archive document.\n\n' +
+            '🛡️ *Nuclear Security Shield:*\n' +
+            'Any `.env` file (`.env`, `.env.local`, `.env.production`) will be automatically extracted, saved into *Cloudflare D1* (`repo_envs`), and *strictly purged* from the codebase before pushing to GitHub.',
+            {
+                chat_id: chat,
+                message_id: msgId,
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔙 Back', callback_data: 'action_deploy_app' }]
+                    ]
+                }
+            }
+        ).catch(() => {});
+        return;
+    }
+
+    // Deploy App: Separated Flow (Step 1)
+    if (action === 'deploy_env_separated') {
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        const session = getSession(chat);
+        session.state = 'WAITING_REPO_SEP';
+        session.deployStaging = null;
+        await bot.editMessageText(
+            '📑 *Separated Deployment (Step 1 of 2)*\n\n' +
+            'Please upload your repository as a `.zip` file document, or send a public GitHub repository link (e.g. `https://github.com/user/my-app`):\n\n' +
+            'ℹ️ *Note:* Keep your `.env` separate. You will be prompted to provide it in Step 2.',
+            {
+                chat_id: chat,
+                message_id: msgId,
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔙 Back', callback_data: 'action_deploy_app' }]
+                    ]
+                }
+            }
+        ).catch(() => {});
+        return;
+    }
+
+    // Deploy App: Skip Env in Separated Flow
+    if (action === 'deploy_skip_env_sep') {
+        await bot.answerCallbackQuery(query.id).catch(() => {});
+        const session = getSession(chat);
+        if (session.state !== 'WAITING_ENV_SEP' || !session.deployStaging) {
+            await bot.sendMessage(chat, '⚠️ No pending repository staging found. Please start over from Deploy App.', getWelcomeMenu(userId));
+            return;
+        }
+        await executeDeployPush(chat, session, {});
         return;
     }
 
@@ -1361,6 +1521,113 @@ async function submitOtpAndHarvestToken(chat, statusMsgId, otp) {
 }
 
 // ----------------------------------------------------
+// Core Deploy App Pipeline Execution
+// ----------------------------------------------------
+async function executeDeployPush(chat, session, additionalEnvs = {}) {
+    const staging = session.deployStaging;
+    if (!staging || !staging.files || staging.files.length === 0) {
+        session.state = 'IDLE';
+        session.deployStaging = null;
+        await bot.sendMessage(chat, '❌ No files found to deploy. Please upload a valid .zip repository archive.');
+        return;
+    }
+
+    const repoName = staging.repoName;
+    const allEnvs = { ...(staging.extractedEnvs || {}), ...(additionalEnvs || {}) };
+    const envKeys = Object.keys(allEnvs);
+
+    const progressMsg = await bot.sendMessage(chat, '⏳ *Initiating Deployment Pipeline...*\n`[░░░░░░░░░░]` *0%*', { parse_mode: 'Markdown' });
+
+    try {
+        // Step 1: Save Environment Variables to Cloudflare D1
+        let envSavedCount = 0;
+        if (envKeys.length > 0) {
+            await bot.editMessageText(
+                `🔐 *Securing Environment Secrets in Cloudflare D1...*\n` +
+                `Found *${envKeys.length}* variables.\n` +
+                '`[████░░░░░░]` *40%*', {
+                chat_id: chat,
+                message_id: progressMsg.message_id,
+                parse_mode: 'Markdown'
+            }).catch(() => {});
+
+            envSavedCount = await saveD1RepoEnvs(repoName, allEnvs);
+            await saveD1RepoDeployment(repoName, 'PENDING');
+        } else {
+            await saveD1RepoDeployment(repoName, 'PENDING');
+        }
+
+        // Step 2: Push Sanitized Codebase to GitHub
+        await bot.editMessageText(
+            `🚀 *Pushing Sanitized Codebase to GitHub...*\n` +
+            `Target Repository: \`${repoName}\` (${staging.files.length} clean files)\n` +
+            '`[████████░░]` *80%*', {
+            chat_id: chat,
+            message_id: progressMsg.message_id,
+            parse_mode: 'Markdown'
+        }).catch(() => {});
+
+        const pushResult = await pushFilesToGitHub(repoName, staging.files, `Multiverse Deploy App: ${repoName} [skip ci]`);
+
+        // Step 3: Send Final Success Card
+        let envStatusText = 'No secrets required';
+        if (envSavedCount > 0) {
+            envStatusText = `✅ *${envSavedCount}* variables securely stored in Cloudflare D1 (\`repo_envs\`)`;
+        }
+
+        let strippedNotice = '';
+        if (staging.strippedEnvFiles && staging.strippedEnvFiles.length > 0) {
+            strippedNotice = `\n🛡️ *Purged Sensitive Files:* \`${staging.strippedEnvFiles.map(s => s.path).join(', ')}\``;
+        }
+
+        const successText = 
+            `🎉 *Deployment Succeeded!*\n\n` +
+            `📁 *Repository:* [${pushResult.owner}/${repoName}](${pushResult.repoUrl})\n` +
+            `🌐 *Branch:* \`${pushResult.branch}\`\n` +
+            `💾 *Commit:* \`${pushResult.commitSha}\`\n` +
+            `📦 *Files Committed:* ${pushResult.filesCount}\n` +
+            `🔐 *Environment:* ${envStatusText}${strippedNotice}\n\n` +
+            `✨ *Status:* Successfully saved into directory & pushed to GitHub.`;
+
+        await bot.editMessageText(successText, {
+            chat_id: chat,
+            message_id: progressMsg.message_id,
+            parse_mode: 'Markdown',
+            disable_web_page_preview: true,
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '🔗 Open GitHub Repository', url: pushResult.repoUrl }],
+                    [{ text: '🚀 Deploy Another App', callback_data: 'action_deploy_app' }],
+                    [{ text: '🔙 Main Menu', callback_data: 'menu_main' }]
+                ]
+            }
+        }).catch(async () => {
+            await bot.sendMessage(chat, successText, {
+                parse_mode: 'Markdown',
+                disable_web_page_preview: true
+            }).catch(() => {});
+        });
+
+    } catch (err) {
+        console.error('Deployment Pipeline Error:', err);
+        await bot.editMessageText(`❌ *Deployment Pipeline Failed:*\n\n\`${err.message}\`\n\nPlease check your repository archive or GitHub permissions and try again.`, {
+            chat_id: chat,
+            message_id: progressMsg.message_id,
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '🔄 Retry Deploy App', callback_data: 'action_deploy_app' }],
+                    [{ text: '🔙 Main Menu', callback_data: 'menu_main' }]
+                ]
+            }
+        }).catch(() => {});
+    } finally {
+        session.state = 'IDLE';
+        session.deployStaging = null;
+    }
+}
+
+// ----------------------------------------------------
 // Incoming Text Messages Handler
 // ----------------------------------------------------
 bot.on('message', async (msg) => {
@@ -1371,6 +1638,184 @@ bot.on('message', async (msg) => {
 
     // Ignore commands
     if (text.startsWith('/')) return;
+
+    // ----------------------------------------------------
+    // Document Uploads (ZIP Repositories & .env Files)
+    // ----------------------------------------------------
+    if (msg.document) {
+        const doc = msg.document;
+        const fileName = doc.file_name || 'archive.zip';
+
+        // 1. Merged Deployment Flow
+        if (session.state === 'WAITING_REPO_MERGED') {
+            if (!fileName.toLowerCase().endsWith('.zip')) {
+                await bot.sendMessage(chat, '⚠️ Please upload a valid `.zip` repository archive file.');
+                return;
+            }
+
+            const waitMsg = await bot.sendMessage(chat, '📥 *Downloading and analyzing repository archive...*', { parse_mode: 'Markdown' });
+            try {
+                const fileLink = await bot.getFileLink(doc.file_id);
+                const res = await fetch(fileLink);
+                if (!res.ok) throw new Error(`Failed to download file from Telegram: ${res.statusText}`);
+                const arrayBuffer = await res.arrayBuffer();
+                const zipBuffer = Buffer.from(arrayBuffer);
+
+                const processed = extractAndPurgeRepoZip(zipBuffer, fileName);
+                session.deployStaging = processed;
+
+                await bot.deleteMessage(chat, waitMsg.message_id).catch(() => {});
+                await executeDeployPush(chat, session, {});
+            } catch (err) {
+                console.error('[Merged Flow Error]:', err);
+                await bot.editMessageText(`❌ Failed to process archive: ${err.message}`, {
+                    chat_id: chat,
+                    message_id: waitMsg.message_id
+                }).catch(() => {});
+                session.state = 'IDLE';
+                session.deployStaging = null;
+            }
+            return;
+        }
+
+        // 2. Separated Deployment Flow (Step 1: Repo Upload)
+        if (session.state === 'WAITING_REPO_SEP') {
+            if (!fileName.toLowerCase().endsWith('.zip')) {
+                await bot.sendMessage(chat, '⚠️ Please upload a valid `.zip` repository archive file or send a GitHub URL.');
+                return;
+            }
+
+            const waitMsg = await bot.sendMessage(chat, '📥 *Downloading and analyzing repository archive...*', { parse_mode: 'Markdown' });
+            try {
+                const fileLink = await bot.getFileLink(doc.file_id);
+                const res = await fetch(fileLink);
+                if (!res.ok) throw new Error(`Failed to download file from Telegram: ${res.statusText}`);
+                const arrayBuffer = await res.arrayBuffer();
+                const zipBuffer = Buffer.from(arrayBuffer);
+
+                const processed = extractAndPurgeRepoZip(zipBuffer, fileName);
+                session.deployStaging = processed;
+                session.state = 'WAITING_ENV_SEP';
+
+                let envNote = '';
+                if (processed.strippedEnvFiles.length > 0) {
+                    envNote = `\n\n🛡️ *Security Shield:* Found and extracted \`${processed.strippedEnvFiles.map(s => s.path).join(', ')}\` (${Object.keys(processed.extractedEnvs).length} variables saved to Cloudflare D1 staging).`;
+                }
+
+                await bot.editMessageText(
+                    `📑 *Separated Deployment (Step 2 of 2)*\n\n` +
+                    `Repository received: *${processed.repoName}* (${processed.totalFiles} files).${envNote}\n\n` +
+                    `Now please provide your \`.env\` configuration:\n` +
+                    `• Send your \`.env\` content directly as a text message, OR\n` +
+                    `• Upload a \`.env\` file document.\n\n` +
+                    `*(Or click "⏩ Skip .env" if this app requires no environment variables)*`,
+                    {
+                        chat_id: chat,
+                        message_id: waitMsg.message_id,
+                        parse_mode: 'Markdown',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{ text: '⏩ Skip .env', callback_data: 'deploy_skip_env_sep' }],
+                                [{ text: '🔙 Cancel', callback_data: 'action_deploy_app' }]
+                            ]
+                        }
+                    }
+                ).catch(() => {});
+            } catch (err) {
+                console.error('[Separated Flow Error]:', err);
+                await bot.editMessageText(`❌ Failed to process archive: ${err.message}`, {
+                    chat_id: chat,
+                    message_id: waitMsg.message_id
+                }).catch(() => {});
+                session.state = 'IDLE';
+                session.deployStaging = null;
+            }
+            return;
+        }
+
+        // 3. Separated Deployment Flow (Step 2: .env File Upload)
+        if (session.state === 'WAITING_ENV_SEP') {
+            const waitMsg = await bot.sendMessage(chat, '📥 *Processing .env file...*', { parse_mode: 'Markdown' });
+            try {
+                const fileLink = await bot.getFileLink(doc.file_id);
+                const res = await fetch(fileLink);
+                if (!res.ok) throw new Error(`Failed to download .env from Telegram: ${res.statusText}`);
+                const textContent = await res.text();
+                const envMap = parseEnvContent(textContent);
+
+                await bot.deleteMessage(chat, waitMsg.message_id).catch(() => {});
+                await executeDeployPush(chat, session, envMap);
+            } catch (err) {
+                console.error('[Env File Error]:', err);
+                await bot.editMessageText(`❌ Failed to read .env file: ${err.message}`, {
+                    chat_id: chat,
+                    message_id: waitMsg.message_id
+                }).catch(() => {});
+            }
+            return;
+        }
+    }
+
+    // ----------------------------------------------------
+    // Text Inputs for Deploy App
+    // ----------------------------------------------------
+    if (session.state === 'WAITING_REPO_SEP') {
+        if (text.includes('github.com')) {
+            const waitMsg = await bot.sendMessage(chat, '📥 *Fetching repository from GitHub...*', { parse_mode: 'Markdown' });
+            try {
+                const { buffer, repoName } = await downloadGitHubRepoZip(text);
+                const processed = extractAndPurgeRepoZip(buffer, repoName);
+                session.deployStaging = processed;
+                session.state = 'WAITING_ENV_SEP';
+
+                let envNote = '';
+                if (processed.strippedEnvFiles.length > 0) {
+                    envNote = `\n\n🛡️ *Security Shield:* Found and extracted \`${processed.strippedEnvFiles.map(s => s.path).join(', ')}\` (${Object.keys(processed.extractedEnvs).length} variables saved to Cloudflare D1 staging).`;
+                }
+
+                await bot.editMessageText(
+                    `📑 *Separated Deployment (Step 2 of 2)*\n\n` +
+                    `Repository fetched: *${processed.repoName}* (${processed.totalFiles} files).${envNote}\n\n` +
+                    `Now please provide your \`.env\` configuration:\n` +
+                    `• Send your \`.env\` content directly as a text message, OR\n` +
+                    `• Upload a \`.env\` file document.\n\n` +
+                    `*(Or click "⏩ Skip .env" if this app requires no environment variables)*`,
+                    {
+                        chat_id: chat,
+                        message_id: waitMsg.message_id,
+                        parse_mode: 'Markdown',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{ text: '⏩ Skip .env', callback_data: 'deploy_skip_env_sep' }],
+                                [{ text: '🔙 Cancel', callback_data: 'action_deploy_app' }]
+                            ]
+                        }
+                    }
+                ).catch(() => {});
+            } catch (err) {
+                console.error('[GitHub Link Fetch Error]:', err);
+                await bot.editMessageText(`❌ Failed to fetch GitHub repository: ${err.message}`, {
+                    chat_id: chat,
+                    message_id: waitMsg.message_id
+                }).catch(() => {});
+            }
+            return;
+        } else {
+            await bot.sendMessage(chat, '⚠️ Please upload a `.zip` file document or send a valid public GitHub URL (e.g. `https://github.com/user/my-repo`).');
+            return;
+        }
+    }
+
+    if (session.state === 'WAITING_ENV_SEP') {
+        if (text.includes('=')) {
+            const envMap = parseEnvContent(text);
+            await executeDeployPush(chat, session, envMap);
+            return;
+        } else {
+            await bot.sendMessage(chat, '⚠️ Please send valid `.env` variables with `KEY=VALUE` pairs, or click "⏩ Skip .env".');
+            return;
+        }
+    }
 
     // Handle Adding Authorized User (from Setup)
     if (session.state === 'WAITING_NEW_USER_SETUP') {

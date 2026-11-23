@@ -4,6 +4,9 @@ FROM node:20-bookworm-slim
 # Set working directory
 WORKDIR /app
 
+# Install git and system tools
+RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
+
 # Copy package files
 COPY package*.json ./
 
