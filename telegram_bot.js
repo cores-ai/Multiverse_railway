@@ -13,7 +13,8 @@ const {
     parseEnvContent,
     extractAndPurgeRepoZip,
     pushFilesToGitHub,
-    downloadGitHubRepoZip
+    downloadGitHubRepoZip,
+    downloadTelegramFileBuffer
 } = require('./deploy_pipeline');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -1655,12 +1656,7 @@ bot.on('message', async (msg) => {
 
             const waitMsg = await bot.sendMessage(chat, '📥 *Downloading and analyzing repository archive...*', { parse_mode: 'Markdown' });
             try {
-                const fileLink = await bot.getFileLink(doc.file_id);
-                const res = await fetch(fileLink);
-                if (!res.ok) throw new Error(`Failed to download file from Telegram: ${res.statusText}`);
-                const arrayBuffer = await res.arrayBuffer();
-                const zipBuffer = Buffer.from(arrayBuffer);
-
+                const zipBuffer = await downloadTelegramFileBuffer(bot, doc.file_id);
                 const processed = extractAndPurgeRepoZip(zipBuffer, fileName);
                 session.deployStaging = processed;
 
@@ -1687,12 +1683,7 @@ bot.on('message', async (msg) => {
 
             const waitMsg = await bot.sendMessage(chat, '📥 *Downloading and analyzing repository archive...*', { parse_mode: 'Markdown' });
             try {
-                const fileLink = await bot.getFileLink(doc.file_id);
-                const res = await fetch(fileLink);
-                if (!res.ok) throw new Error(`Failed to download file from Telegram: ${res.statusText}`);
-                const arrayBuffer = await res.arrayBuffer();
-                const zipBuffer = Buffer.from(arrayBuffer);
-
+                const zipBuffer = await downloadTelegramFileBuffer(bot, doc.file_id);
                 const processed = extractAndPurgeRepoZip(zipBuffer, fileName);
                 session.deployStaging = processed;
                 session.state = 'WAITING_ENV_SEP';
@@ -1737,10 +1728,8 @@ bot.on('message', async (msg) => {
         if (session.state === 'WAITING_ENV_SEP') {
             const waitMsg = await bot.sendMessage(chat, '📥 *Processing .env file...*', { parse_mode: 'Markdown' });
             try {
-                const fileLink = await bot.getFileLink(doc.file_id);
-                const res = await fetch(fileLink);
-                if (!res.ok) throw new Error(`Failed to download .env from Telegram: ${res.statusText}`);
-                const textContent = await res.text();
+                const envBuffer = await downloadTelegramFileBuffer(bot, doc.file_id);
+                const textContent = envBuffer.toString('utf8');
                 const envMap = parseEnvContent(textContent);
 
                 await bot.deleteMessage(chat, waitMsg.message_id).catch(() => {});

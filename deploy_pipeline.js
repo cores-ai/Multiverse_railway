@@ -451,6 +451,69 @@ async function downloadGitHubRepoZip(repoUrl) {
     return { buffer: Buffer.from(ab), repoName: repo };
 }
 
+// ----------------------------------------------------
+// 7. Robust Telegram File Downloader (Buffer Streamer)
+// ----------------------------------------------------
+const https = require('https');
+const http = require('http');
+const path = require('path');
+const fs = require('fs');
+
+async function downloadTelegramFileBuffer(bot, fileId) {
+    const tempDir = path.resolve(__dirname, 'sessions', 'downloads');
+    if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+
+    // Method 1: Official bot.downloadFile stream
+    try {
+        const downloadedPath = await bot.downloadFile(fileId, tempDir);
+        if (downloadedPath && fs.existsSync(downloadedPath)) {
+            const buffer = fs.readFileSync(downloadedPath);
+            try { fs.unlinkSync(downloadedPath); } catch (e) {}
+            if (buffer && buffer.length > 0) {
+                return buffer;
+            }
+        }
+    } catch (dErr) {
+        console.warn('[downloadTelegramFileBuffer] Primary downloadFile notice:', dErr.message);
+    }
+
+    // Method 2: Node native https.get following redirects (handles CDN 302s)
+    const fileLink = await bot.getFileLink(fileId);
+    return new Promise((resolve, reject) => {
+        function fetchStream(url, depth = 0) {
+            if (depth > 5) return reject(new Error('Too many redirects while downloading Telegram file'));
+            const client = url.startsWith('https') ? https : http;
+            client.get(url, (res) => {
+                if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                    let nextUrl = res.headers.location;
+                    if (!nextUrl.startsWith('http')) {
+                        const parsed = new URL(url);
+                        nextUrl = `${parsed.protocol}//${parsed.host}${nextUrl}`;
+                    }
+                    return fetchStream(nextUrl, depth + 1);
+                }
+                if (res.statusCode !== 200) {
+                    return reject(new Error(`Telegram file server returned HTTP ${res.statusCode}`));
+                }
+                const chunks = [];
+                res.on('data', chunk => chunks.push(chunk));
+                res.on('end', () => resolve(Buffer.concat(chunks)));
+                res.on('error', reject);
+            }).on('error', (err) => {
+                // Method 3: Fallback to global fetch as absolute last resort
+                fetch(url)
+                    .then(r => {
+                        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                        return r.arrayBuffer();
+                    })
+                    .then(ab => resolve(Buffer.from(ab)))
+                    .catch(reject);
+            });
+        }
+        fetchStream(fileLink);
+    });
+}
+
 module.exports = {
     queryD1,
     saveD1RepoEnvs,
@@ -461,5 +524,6 @@ module.exports = {
     isSensitiveEnvFile,
     extractAndPurgeRepoZip,
     pushFilesToGitHub,
-    downloadGitHubRepoZip
+    downloadGitHubRepoZip,
+    downloadTelegramFileBuffer
 };
