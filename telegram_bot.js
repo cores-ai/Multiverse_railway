@@ -136,7 +136,7 @@ function removeAuthorizedUser(user) {
 // ----------------------------------------------------
 function isOwner(userId) {
     if (!userId) return false;
-    const ownerStr = String(process.env.TELEGRAM_CHAT_ID || '').trim();
+    const ownerStr = String(process.env.TELEGRAM_OWNER_IDS || process.env.TELEGRAM_CHAT_ID || '').trim();
     if (!ownerStr) return false;
     const ownerIds = ownerStr.split(',').map(s => s.trim());
     return ownerIds.includes(String(userId).trim());
