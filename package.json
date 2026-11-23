@@ -1,0 +1,18 @@
+{
+  "name": "multiverse-railway-worker",
+  "version": "1.0.0",
+  "description": "Multiverse 24/7 Autonomous Railway Stealth Harvester & Daemon",
+  "main": "auto_railway_daemon.js",
+  "scripts": {
+    "start": "node auto_railway_daemon.js",
+    "daemon": "node auto_railway_daemon.js",
+    "worker": "node account_worker.js",
+    "delete": "node delete_worker.js",
+    "bot": "node telegram_bot.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "node-telegram-bot-api": "^0.66.0",
+    "playwright": "^1.50.0"
+  }
+}
